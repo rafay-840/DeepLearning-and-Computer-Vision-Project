@@ -180,7 +180,9 @@ The full written report (16 pages, including 8 figures) is available in [`report
 
 ## Authors
 
-[Author Name(s)] — MSc Artificial Intelligence, University of Verona
+Rafay Saif (VR546150)
+Fayyaz Hussain Shah(VR546175)
+MSc Artificial Intelligence, University of Verona
 
 ---
 
