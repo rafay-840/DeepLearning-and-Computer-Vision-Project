@@ -139,43 +139,69 @@ class EngagementVideoProcessor(VideoProcessorBase):
         self.colors = None         # set externally after instantiation
 
     def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
-        img_bgr = frame.to_ndarray(format="bgr24")
-
-        tensor = preprocess_frame(img_bgr)
-        with self.lock:
-            self.frame_buffer.append(tensor)
-
-            ready = (len(self.frame_buffer) == SEQUENCE_LENGTH
-                     and self.model is not None
-                     and self.class_names is not None)
-
+        img  = frame.to_ndarray(format="bgr24")
+        disp = img.copy()
+ 
+        with self._lock:
+            self._n += 1
+            roi, bbox = img, None
+ 
+            # Enhancement 2: face crop
+            if self.use_face_roi:
+                cropped, bbox = self._cropper.crop(img)
+                if cropped is not None:
+                    roi = cropped
+ 
+            # Enhancement 8: frame stride
+            if self._n % max(1, self.frame_stride) == 0:
+                self._buf.append(preprocess(roi))
+ 
+            # Inference
+            ready = (
+                len(self._buf) == SEQUENCE_LENGTH
+                and self.model is not None
+                and self.class_names is not None
+            )
             if ready:
-                sequence = torch.stack(list(self.frame_buffer)).unsqueeze(0)  # (1, 8, 3, 112, 112)
+                # Enhancement 9: move to model's device
+                device = next(self.model.parameters()).device
+                seq = torch.stack(list(self._buf)).unsqueeze(0).to(device)
+ 
                 with torch.no_grad():
-                    logits = self.model(sequence)
-                    probs = torch.softmax(logits, dim=1)
-                    pred_class = logits.argmax(dim=1).item()
-                    confidence = probs[0, pred_class].item()
-
-                self.latest_prediction = self.class_names[pred_class]
-                self.latest_confidence = confidence
-
-        # Overlay the current prediction on the displayed frame
-        display_frame = img_bgr.copy()
-        if self.latest_confidence > 0:
-            label = f"{self.latest_prediction} ({self.latest_confidence:.0%})"
-        else:
-            label = self.latest_prediction
-
-        color = (200, 200, 200)  # default gray while buffering
-        if self.colors is not None and self.latest_prediction in self.colors:
-            color = self.colors[self.latest_prediction]
-
-        cv2.rectangle(display_frame, (10, 10), (360, 55), (30, 30, 30), -1)
-        cv2.putText(display_frame, label, (20, 42), cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
-
-        return av.VideoFrame.from_ndarray(display_frame, format="bgr24")
-
+                    logits = self.model(seq)
+                    probs  = torch.softmax(logits, dim=1)
+                    idx    = logits.argmax(1).item()
+                    raw_conf = probs[0, idx].item()
+ 
+                # Enhancement 7: confidence threshold → 'uncertain'
+                raw_label = (
+                    self.class_names[idx]
+                    if raw_conf >= self.conf_threshold
+                    else "uncertain"
+                )
+ 
+                # Enhancement 3: temporal smoothing
+                label, conf = self._smoother.update(
+                    raw_label, raw_conf, self.smoothing_window
+                )
+ 
+                self.latest_label = label
+                self.latest_conf  = conf
+ 
+                # Enhancement 4: log for analytics
+                self.logger.log(label, conf)
+ 
+                # Enhancement 6: disengagement timer
+                if label == "disengaged":
+                    if self._diseng_t is None:
+                        self._diseng_t = time.time()
+                    self.disengaged_secs = time.time() - self._diseng_t
+                else:
+                    self._diseng_t       = None
+                    self.disengaged_secs = 0.0
+ 
+        self._draw_overlay(disp, bbox)
+        return av.VideoFrame.from_ndarray(disp, format="bgr24")
 
 # ─────────────────────────────────────────────────────────
 # Streamlit UI
