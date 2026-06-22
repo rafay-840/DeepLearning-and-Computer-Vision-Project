@@ -58,37 +58,30 @@ MODE_CONFIG = {
     },
 }
 
-
 class CNNLSTMClassifier(nn.Module):
-    def __init__(self, backbone="resnet18", num_classes=2, lstm_hidden_size=256,
-                 lstm_num_layers=1, dropout=0.5, pretrained=False):
+    def __init__(self, num_classes: int = 2, lstm_hidden: int = 256,
+                 lstm_layers: int = 1, dropout: float = 0.5):
         super().__init__()
-        if backbone == "resnet18":
-            weights = models.ResNet18_Weights.IMAGENET1K_V1 if pretrained else None
-            cnn = models.resnet18(weights=weights)
-            self.cnn_backbone = nn.Sequential(*list(cnn.children())[:-2])
-            self.cnn_pool = nn.AdaptiveAvgPool2d(1)
-            feature_dim = 512
-        else:
-            raise ValueError(f"Unsupported backbone for demo: {backbone}")
-
-        self.feature_dim = feature_dim
-        self.lstm = nn.LSTM(input_size=feature_dim, hidden_size=lstm_hidden_size,
-                             num_layers=lstm_num_layers, batch_first=True,
-                             dropout=dropout if lstm_num_layers > 1 else 0.0)
-        self.classifier = nn.Sequential(nn.Dropout(dropout), nn.Linear(lstm_hidden_size, num_classes))
-
-    def forward(self, x):
-        batch_size, seq_len, C, H, W = x.shape
-        x = x.view(batch_size * seq_len, C, H, W)
-        features = self.cnn_backbone(x)
-        features = self.cnn_pool(features)
-        features = features.view(batch_size, seq_len, self.feature_dim)
-        lstm_out, (h_n, c_n) = self.lstm(features)
-        final_hidden = h_n[-1]
-        logits = self.classifier(final_hidden)
-        return logits
-
+        cnn              = models.resnet18(weights=None)
+        self.backbone    = nn.Sequential(*list(cnn.children())[:-2])
+        self.pool        = nn.AdaptiveAvgPool2d(1)
+        self.feature_dim = 512
+        self.lstm        = nn.LSTM(
+            input_size=self.feature_dim, hidden_size=lstm_hidden,
+            num_layers=lstm_layers, batch_first=True,
+            dropout=dropout if lstm_layers > 1 else 0.0,
+        )
+        self.classifier  = nn.Sequential(
+            nn.Dropout(dropout),
+            nn.Linear(lstm_hidden, num_classes),
+        )
+ 
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, S, C, H, W = x.shape
+        feat = self.pool(self.backbone(x.view(B * S, C, H, W)))
+        feat = feat.view(B, S, self.feature_dim)
+        _, (h_n, _) = self.lstm(feat)
+        return self.classifier(h_n[-1])
 
 @st.cache_resource
 def load_model(checkpoint_path, num_classes):
