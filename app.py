@@ -112,6 +112,107 @@ def preprocess_frame(frame_bgr):
     return tensor
 
 
+class FaceROICropper:
+    """
+    Enhancement 2 — face-detection crop.
+ 
+    Detects the largest frontal face in a frame using a Haar cascade and crops
+    to that region (+ a configurable padding ratio).  This removes background
+    clutter, giving the model a tighter, more informative input region.
+ 
+    Falls back gracefully: if no face is detected the caller receives (None, None)
+    and the full frame is used instead, so inference never stalls.
+    """
+    def __init__(self, pad_ratio: float = 0.20):
+        self.cascade   = cv2.CascadeClassifier(
+            cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+        )
+        self.pad_ratio = pad_ratio
+ 
+    def crop(self, frame: np.ndarray):
+        """Returns (roi_bgr, (x1,y1,x2,y2)) or (None, None) if no face found."""
+        gray  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        faces = self.cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=4)
+        if not len(faces):
+            return None, None
+        x, y, w, h = max(faces, key=lambda f: f[2] * f[3])  # pick largest
+        p  = int(self.pad_ratio * min(w, h))
+        H, W = frame.shape[:2]
+        x1, y1 = max(0, x - p), max(0, y - p)
+        x2, y2 = min(W, x + w + p), min(H, y + h + p)
+        return frame[y1:y2, x1:x2], (x1, y1, x2, y2)
+ 
+ 
+class PredictionSmoother:
+    """
+    Enhancement 3 — temporal prediction smoother.
+ 
+    The CNN+LSTM head is run once per filled 8-frame buffer, which means a single
+    misclassified window flickers visibly at the displayed framerate.  This class
+    collects the last `window` predictions and returns the majority label plus the
+    mean confidence for that label — a simple but effective de-noising step.
+ 
+    The window size is passed in at call time so the UI slider takes effect
+    immediately without needing to recreate the smoother.
+    """
+    def __init__(self):
+        self._hist: list = []   # list of (label, confidence)
+ 
+    def update(self, label: str, conf: float, window: int) -> tuple:
+        self._hist.append((label, conf))
+        self._hist = self._hist[-max(1, window):]          # sliding trim
+        counts   = Counter(lbl for lbl, _ in self._hist)
+        smoothed = counts.most_common(1)[0][0]
+        avg_conf = float(np.mean([c for lbl, c in self._hist if lbl == smoothed]))
+        return smoothed, avg_conf
+ 
+    def reset(self):
+        self._hist.clear()
+ 
+ 
+class SessionLogger:
+    """
+    Enhancement 4 — thread-safe session logger.
+ 
+    Records every smoothed prediction with its elapsed timestamp and confidence
+    score.  The dataframe() method is safe to call from the Streamlit UI thread
+    while recv() is running on the webrtc worker thread.
+    """
+    def __init__(self):
+        self._lock    = threading.Lock()
+        self._records: list = []
+        self._t0      = time.time()
+ 
+    def log(self, label: str, conf: float):
+        with self._lock:
+            self._records.append({
+                "elapsed_s":  round(time.time() - self._t0, 2),
+                "prediction": label,
+                "confidence": round(conf, 3),
+            })
+ 
+    def dataframe(self) -> pd.DataFrame:
+        with self._lock:
+            return pd.DataFrame(list(self._records))
+ 
+    def stats(self) -> dict:
+        df = self.dataframe()
+        if df.empty:
+            return {}
+        total = len(df)
+        return {k: round(v / total * 100, 1)
+                for k, v in df["prediction"].value_counts().items()}
+ 
+    def csv_bytes(self) -> bytes:
+        return self.dataframe().to_csv(index=False).encode()
+ 
+    def clear(self):
+        with self._lock:
+            self._records.clear()
+            self._t0 = time.time()
+
+
+
 class EngagementVideoProcessor(VideoProcessorBase):
     """
     Maintains a rolling buffer of the last SEQUENCE_LENGTH frames and runs
