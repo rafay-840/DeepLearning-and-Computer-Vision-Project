@@ -58,30 +58,37 @@ MODE_CONFIG = {
     },
 }
 
+
 class CNNLSTMClassifier(nn.Module):
-    def __init__(self, num_classes: int = 2, lstm_hidden: int = 256,
-                 lstm_layers: int = 1, dropout: float = 0.5):
+    def __init__(self, backbone="resnet18", num_classes=2, lstm_hidden_size=256,
+                 lstm_num_layers=1, dropout=0.5, pretrained=False):
         super().__init__()
-        cnn              = models.resnet18(weights=None)
-        self.backbone    = nn.Sequential(*list(cnn.children())[:-2])
-        self.pool        = nn.AdaptiveAvgPool2d(1)
-        self.feature_dim = 512
-        self.lstm        = nn.LSTM(
-            input_size=self.feature_dim, hidden_size=lstm_hidden,
-            num_layers=lstm_layers, batch_first=True,
-            dropout=dropout if lstm_layers > 1 else 0.0,
-        )
-        self.classifier  = nn.Sequential(
-            nn.Dropout(dropout),
-            nn.Linear(lstm_hidden, num_classes),
-        )
- 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, S, C, H, W = x.shape
-        feat = self.pool(self.backbone(x.view(B * S, C, H, W)))
-        feat = feat.view(B, S, self.feature_dim)
-        _, (h_n, _) = self.lstm(feat)
-        return self.classifier(h_n[-1])
+        if backbone == "resnet18":
+            weights = models.ResNet18_Weights.IMAGENET1K_V1 if pretrained else None
+            cnn = models.resnet18(weights=weights)
+            self.cnn_backbone = nn.Sequential(*list(cnn.children())[:-2])
+            self.cnn_pool = nn.AdaptiveAvgPool2d(1)
+            feature_dim = 512
+        else:
+            raise ValueError(f"Unsupported backbone for demo: {backbone}")
+
+        self.feature_dim = feature_dim
+        self.lstm = nn.LSTM(input_size=feature_dim, hidden_size=lstm_hidden_size,
+                             num_layers=lstm_num_layers, batch_first=True,
+                             dropout=dropout if lstm_num_layers > 1 else 0.0)
+        self.classifier = nn.Sequential(nn.Dropout(dropout), nn.Linear(lstm_hidden_size, num_classes))
+
+    def forward(self, x):
+        batch_size, seq_len, C, H, W = x.shape
+        x = x.view(batch_size * seq_len, C, H, W)
+        features = self.cnn_backbone(x)
+        features = self.cnn_pool(features)
+        features = features.view(batch_size, seq_len, self.feature_dim)
+        lstm_out, (h_n, c_n) = self.lstm(features)
+        final_hidden = h_n[-1]
+        logits = self.classifier(final_hidden)
+        return logits
+
 
 @st.cache_resource
 def load_model(checkpoint_path, num_classes):
@@ -112,107 +119,6 @@ def preprocess_frame(frame_bgr):
     return tensor
 
 
-class FaceROICropper:
-    """
-    Enhancement 2 — face-detection crop.
- 
-    Detects the largest frontal face in a frame using a Haar cascade and crops
-    to that region (+ a configurable padding ratio).  This removes background
-    clutter, giving the model a tighter, more informative input region.
- 
-    Falls back gracefully: if no face is detected the caller receives (None, None)
-    and the full frame is used instead, so inference never stalls.
-    """
-    def __init__(self, pad_ratio: float = 0.20):
-        self.cascade   = cv2.CascadeClassifier(
-            cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-        )
-        self.pad_ratio = pad_ratio
- 
-    def crop(self, frame: np.ndarray):
-        """Returns (roi_bgr, (x1,y1,x2,y2)) or (None, None) if no face found."""
-        gray  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        faces = self.cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=4)
-        if not len(faces):
-            return None, None
-        x, y, w, h = max(faces, key=lambda f: f[2] * f[3])  # pick largest
-        p  = int(self.pad_ratio * min(w, h))
-        H, W = frame.shape[:2]
-        x1, y1 = max(0, x - p), max(0, y - p)
-        x2, y2 = min(W, x + w + p), min(H, y + h + p)
-        return frame[y1:y2, x1:x2], (x1, y1, x2, y2)
- 
- 
-class PredictionSmoother:
-    """
-    Enhancement 3 — temporal prediction smoother.
- 
-    The CNN+LSTM head is run once per filled 8-frame buffer, which means a single
-    misclassified window flickers visibly at the displayed framerate.  This class
-    collects the last `window` predictions and returns the majority label plus the
-    mean confidence for that label — a simple but effective de-noising step.
- 
-    The window size is passed in at call time so the UI slider takes effect
-    immediately without needing to recreate the smoother.
-    """
-    def __init__(self):
-        self._hist: list = []   # list of (label, confidence)
- 
-    def update(self, label: str, conf: float, window: int) -> tuple:
-        self._hist.append((label, conf))
-        self._hist = self._hist[-max(1, window):]          # sliding trim
-        counts   = Counter(lbl for lbl, _ in self._hist)
-        smoothed = counts.most_common(1)[0][0]
-        avg_conf = float(np.mean([c for lbl, c in self._hist if lbl == smoothed]))
-        return smoothed, avg_conf
- 
-    def reset(self):
-        self._hist.clear()
- 
- 
-class SessionLogger:
-    """
-    Enhancement 4 — thread-safe session logger.
- 
-    Records every smoothed prediction with its elapsed timestamp and confidence
-    score.  The dataframe() method is safe to call from the Streamlit UI thread
-    while recv() is running on the webrtc worker thread.
-    """
-    def __init__(self):
-        self._lock    = threading.Lock()
-        self._records: list = []
-        self._t0      = time.time()
- 
-    def log(self, label: str, conf: float):
-        with self._lock:
-            self._records.append({
-                "elapsed_s":  round(time.time() - self._t0, 2),
-                "prediction": label,
-                "confidence": round(conf, 3),
-            })
- 
-    def dataframe(self) -> pd.DataFrame:
-        with self._lock:
-            return pd.DataFrame(list(self._records))
- 
-    def stats(self) -> dict:
-        df = self.dataframe()
-        if df.empty:
-            return {}
-        total = len(df)
-        return {k: round(v / total * 100, 1)
-                for k, v in df["prediction"].value_counts().items()}
- 
-    def csv_bytes(self) -> bytes:
-        return self.dataframe().to_csv(index=False).encode()
- 
-    def clear(self):
-        with self._lock:
-            self._records.clear()
-            self._t0 = time.time()
-
-
-
 class EngagementVideoProcessor(VideoProcessorBase):
     """
     Maintains a rolling buffer of the last SEQUENCE_LENGTH frames and runs
@@ -233,69 +139,43 @@ class EngagementVideoProcessor(VideoProcessorBase):
         self.colors = None         # set externally after instantiation
 
     def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
-        img  = frame.to_ndarray(format="bgr24")
-        disp = img.copy()
- 
-        with self._lock:
-            self._n += 1
-            roi, bbox = img, None
- 
-            # Enhancement 2: face crop
-            if self.use_face_roi:
-                cropped, bbox = self._cropper.crop(img)
-                if cropped is not None:
-                    roi = cropped
- 
-            # Enhancement 8: frame stride
-            if self._n % max(1, self.frame_stride) == 0:
-                self._buf.append(preprocess(roi))
- 
-            # Inference
-            ready = (
-                len(self._buf) == SEQUENCE_LENGTH
-                and self.model is not None
-                and self.class_names is not None
-            )
+        img_bgr = frame.to_ndarray(format="bgr24")
+
+        tensor = preprocess_frame(img_bgr)
+        with self.lock:
+            self.frame_buffer.append(tensor)
+
+            ready = (len(self.frame_buffer) == SEQUENCE_LENGTH
+                     and self.model is not None
+                     and self.class_names is not None)
+
             if ready:
-                # Enhancement 9: move to model's device
-                device = next(self.model.parameters()).device
-                seq = torch.stack(list(self._buf)).unsqueeze(0).to(device)
- 
+                sequence = torch.stack(list(self.frame_buffer)).unsqueeze(0)  # (1, 8, 3, 112, 112)
                 with torch.no_grad():
-                    logits = self.model(seq)
-                    probs  = torch.softmax(logits, dim=1)
-                    idx    = logits.argmax(1).item()
-                    raw_conf = probs[0, idx].item()
- 
-                # Enhancement 7: confidence threshold → 'uncertain'
-                raw_label = (
-                    self.class_names[idx]
-                    if raw_conf >= self.conf_threshold
-                    else "uncertain"
-                )
- 
-                # Enhancement 3: temporal smoothing
-                label, conf = self._smoother.update(
-                    raw_label, raw_conf, self.smoothing_window
-                )
- 
-                self.latest_label = label
-                self.latest_conf  = conf
- 
-                # Enhancement 4: log for analytics
-                self.logger.log(label, conf)
- 
-                # Enhancement 6: disengagement timer
-                if label == "disengaged":
-                    if self._diseng_t is None:
-                        self._diseng_t = time.time()
-                    self.disengaged_secs = time.time() - self._diseng_t
-                else:
-                    self._diseng_t       = None
-                    self.disengaged_secs = 0.0
- 
-        self._draw_overlay(disp, bbox)
-        return av.VideoFrame.from_ndarray(disp, format="bgr24")
+                    logits = self.model(sequence)
+                    probs = torch.softmax(logits, dim=1)
+                    pred_class = logits.argmax(dim=1).item()
+                    confidence = probs[0, pred_class].item()
+
+                self.latest_prediction = self.class_names[pred_class]
+                self.latest_confidence = confidence
+
+        # Overlay the current prediction on the displayed frame
+        display_frame = img_bgr.copy()
+        if self.latest_confidence > 0:
+            label = f"{self.latest_prediction} ({self.latest_confidence:.0%})"
+        else:
+            label = self.latest_prediction
+
+        color = (200, 200, 200)  # default gray while buffering
+        if self.colors is not None and self.latest_prediction in self.colors:
+            color = self.colors[self.latest_prediction]
+
+        cv2.rectangle(display_frame, (10, 10), (360, 55), (30, 30, 30), -1)
+        cv2.putText(display_frame, label, (20, 42), cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
+
+        return av.VideoFrame.from_ndarray(display_frame, format="bgr24")
+
 
 # ─────────────────────────────────────────────────────────
 # Streamlit UI
